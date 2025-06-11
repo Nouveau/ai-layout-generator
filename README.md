@@ -1,6 +1,7 @@
 # AI Layout Builder Module
 Uses Drupal 10 Layout Builder, Patternkit, and AI modules to auto generate a layout based on a mockup
 
+Note: This is code from a Hackathon that is not currently ready for production. This is a demo of possibilities.
 
 ## Overview
 
