@@ -1,0 +1,601 @@
+<?php
+
+/**
+ * @file
+ * Contains ai_layout_builder.module.
+ */
+
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Logger\LoggerChannelFactoryInterface;
+use Drupal\Core\StringTranslation\StringTranslationTrait;
+use Drupal\Core\Utility\UuidInterface;
+use Drupal\layout_builder\Section;
+use Drupal\layout_builder\SectionComponent;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Adds a spinner overlay to the node form to indicate processing on save.
+ */
+function ai_layout_builder_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Target the relevant node page forms.
+  $target_forms = [
+    'node_page_form',
+    'node_page_edit_form',
+  ];
+
+  if (in_array($form_id, $target_forms)) {
+    // Attach the spinner library (defined in ai_layout_builder.libraries.yml).
+    $form['#attached']['library'][] = 'ai_layout_builder/spinner';
+
+    // Add the HTML for the spinner overlay to the end of the form.
+    $form['spinner_overlay'] = [
+      '#markup' => '<div id="ai-layout-builder-spinner-overlay"><div class="spinner"></div><div class="spinner-text">Generating Layout...</div></div>',
+      '#weight' => 999, // Ensure it's rendered at the end.
+    ];
+
+    // Add the CSS for the spinner and overlay directly to the form's attachment.
+    $form['#attached']['html_head'][] = [
+      [
+        '#tag' => 'style',
+        '#value' => "
+          #ai-layout-builder-spinner-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.85);
+            z-index: 10000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+          }
+          #ai-layout-builder-spinner-overlay .spinner {
+            border: 8px solid #f3f3f3; /* Light grey */
+            border-top: 8px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1.5s linear infinite;
+          }
+          #ai-layout-builder-spinner-overlay .spinner-text {
+            margin-top: 20px;
+            font-size: 1.2em;
+            color: #333;
+            font-family: sans-serif;
+          }
+          @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+          }
+        ",
+      ],
+      'ai_layout_builder_spinner_styles',
+    ];
+  }
+}
+
+
+/**
+ * Implements hook_node_presave().
+ *
+ * Programmatically builds Layout Builder layouts from JSON input on node creation.
+ */
+function ai_layout_builder_node_presave(NodeInterface $node): void {
+  /** @var \Drupal\Core\Utility\UuidInterface $uuidService */
+  $uuidService = \Drupal::service('uuid');
+  /** @var \Drupal\Core\Entity\EntityTypeManagerInterface $entityTypeManager */
+  $entityTypeManager = \Drupal::service('entity_type.manager');
+  /** @var \Drupal\Core\Logger\LoggerChannelFactoryInterface $loggerFactory */
+  $loggerFactory = \Drupal::service('logger.factory');
+  $logger = $loggerFactory->get('ai_layout_builder');
+
+  // Check if it's a new node of the target content type.
+  $targetContentType = 'page';
+  if (!$node->isNew() || $node->bundle() !== $targetContentType) {
+    return;
+  }
+
+  // Ensure Layout Builder field exists.
+  if (!$node->hasField('layout_builder__layout')) {
+    $logger->error('Layout Builder field "layout_builder__layout" not found on node type @type.', ['@type' => $node->bundle()]);
+    return;
+  }
+
+  // Retrieve your parsed JSON data for the given node.
+  $layoutData = _ai_layout_builder_get_layout_data_for_node($node);
+
+  if (empty($layoutData) || !isset($layoutData['sections'])) {
+    $logger->warning('No layout data found or sections missing for node @nid (type: @type). Layout will not be applied by AI Layout Builder.', [
+      '@nid' => $node->id() ?? 'new',
+      '@type' => $node->bundle(),
+    ]);
+    return;
+  }
+
+  $sections = []; // Array to hold Drupal\layout_builder\Section objects
+
+  // Build Layout Sections and Components
+  foreach ($layoutData['sections'] as $jsonSectionData) {
+    if (empty($jsonSectionData['layout_plugin_id'])) {
+        $logger->warning('Skipping section due to missing "layout_plugin_id".');
+        continue;
+    }
+    $sectionUuid = $uuidService->generate();
+    $layoutPluginId = $jsonSectionData['layout_plugin_id'];
+    $layoutSettings = $jsonSectionData['layout_settings'] ?? [];
+    $componentsForSection = [];
+
+    if (!empty($jsonSectionData['components'])) {
+      foreach ($jsonSectionData['components'] as $jsonBlockData) {
+        if (empty($jsonBlockData['region']) || empty($jsonBlockData['type'])) {
+            $logger->warning('Skipping component in section @section_uuid due to missing region or type.', ['@section_uuid' => $sectionUuid]);
+            continue;
+        }
+        $componentUuid = $uuidService->generate();
+        $region = $jsonBlockData['region'];
+
+        // This is the Layout Builder plugin ID (e.g., patternkit_block:webRh_sub__patterns_card__flex_card__flex)
+        $layoutBuilderPluginId = $jsonBlockData['plugin_id'] ?? NULL;
+        // Meta-data for configuring the Layout Builder SectionComponent
+        $componentMetaDataForLayoutBuilder = $jsonBlockData['component_meta'] ?? [];
+        // Data to be saved into the patternkit entity's 'data' field
+        $patternEntityDataToSave = $jsonBlockData['pattern_entity_data'] ?? NULL;
+
+        $finalComponentConfigurationForLayoutBuilder = [];
+
+        if ($jsonBlockData['type'] === 'inline_block' && $layoutBuilderPluginId && strpos($layoutBuilderPluginId, 'patternkit_block:') === 0 && $patternEntityDataToSave) {
+          // This is a Patternkit block. Create a patternkit entity.
+          try {
+            // Corrected entity type ID based on the PatternkitBlock entity definition.
+            $patternkitBlockStorage = $entityTypeManager->getStorage('patternkit_block');
+
+            // The 'name' value from the pattern_entity_data (e.g., "@webRh/sub_patterns/card_flex/card_flex")
+            // is the bundle for the patternkit entity.
+            $patternkitBlockBundle = $patternEntityDataToSave['name'] ?? NULL;
+            if (!$patternkitBlockBundle) {
+              $logger->error('Missing "name" key in pattern_entity_data for Patternkit block @plugin_id. This is needed as the bundle for patternkit entity.', ['@plugin_id' => $layoutBuilderPluginId]);
+              continue; // Skip this component
+            }
+
+            // The 'pattern' key from component_meta (e.g., '117191') is the ID of the specific pattern definition.
+            $patternDefinitionId = $componentMetaDataForLayoutBuilder['pattern'] ?? NULL;
+            if (!$patternDefinitionId) {
+                $logger->error('Missing "pattern" key in component_meta for Patternkit block @plugin_id. This identifies the pattern definition for Layout Builder.', ['@plugin_id' => $layoutBuilderPluginId]);
+                // Potentially continue if not strictly needed by the LB component config, but good to have.
+            }
+
+            $patternkitBlockInfo = $componentMetaDataForLayoutBuilder['label'] ?? $layoutBuilderPluginId;
+
+            $newPatternkitBlock = $patternkitBlockStorage->create([
+              'type' => (string) $patternkitBlockBundle, // Bundle is the pattern's path, e.g., "@webRh/..."
+              'info' => $patternkitBlockInfo,           // Admin label for the patternkit entity
+              'data' => json_encode($patternEntityDataToSave), // Store the actual pattern configuration as JSON
+              'langcode' => $node->language()->getId(),
+              'pattern_id' => (string) $patternkitBlockBundle, // Set the required pattern_id field.
+              // 'reusable' => FALSE, // Default is usually fine for PK entities created this way.
+            ]);
+            $newPatternkitBlock->save();
+            $newPatternkitBlockRid = $newPatternkitBlock->getRevisionId();
+            $logger->info('Created new patternkit_block entity of type @type with RID @rid for node @nid.', [
+                '@type' => $patternkitBlockBundle,
+                '@rid' => $newPatternkitBlockRid,
+                '@nid' => $node->id() ?? 'new',
+            ]);
+
+            // Configure the Layout Builder component to reference this saved patternkit entity.
+            $finalComponentConfigurationForLayoutBuilder = [
+              'id' => $layoutBuilderPluginId,
+              'provider' => 'patternkit', // Patternkit blocks are provided by Patternkit
+              'label' => $componentMetaDataForLayoutBuilder['label'] ?? $layoutBuilderPluginId,
+              'label_display' => $componentMetaDataForLayoutBuilder['label_display'] ?? 'visible',
+              'patternkit_block_rid' => $newPatternkitBlockRid, // Reference to the saved entity's revision
+              'reusable' => TRUE, // It's referencing a reusable entity instance
+              'context_mapping' => $componentMetaDataForLayoutBuilder['context_mapping'] ?? [],
+              'presentation_style' => $componentMetaDataForLayoutBuilder['presentation_style'] ?? 'html',
+              'version' => $componentMetaDataForLayoutBuilder['version'] ?? '1.0.0', // Or your default
+              'pattern' => (string) $patternDefinitionId, // The pattern definition ID (e.g., '117191')
+            ];
+          }
+          catch (\Exception $e) {
+            $logger->error('Failed to create or configure patternkit entity for @plugin_id: @message. Trace: @trace', [
+              '@plugin_id' => $layoutBuilderPluginId,
+              '@message' => $e->getMessage(),
+              '@trace' => $e->getTraceAsString(),
+            ]);
+            continue; // Skip this component if entity creation failed
+          }
+        }
+        elseif ($jsonBlockData['type'] === 'inline_block' && $layoutBuilderPluginId) {
+          // Handle other generic inline blocks (not Patternkit entities)
+          $finalComponentConfigurationForLayoutBuilder = $componentMetaDataForLayoutBuilder; // Use component_meta as the base
+          $finalComponentConfigurationForLayoutBuilder['id'] = $layoutBuilderPluginId;
+          if (!isset($finalComponentConfigurationForLayoutBuilder['provider'])) {
+            try {
+              $blockManager = \Drupal::service('plugin.manager.block');
+              $pluginDefinition = $blockManager->getDefinition($layoutBuilderPluginId, FALSE);
+              if ($pluginDefinition && isset($pluginDefinition['provider'])) {
+                $finalComponentConfigurationForLayoutBuilder['provider'] = $pluginDefinition['provider'];
+              } else {
+                $logger->warning('Could not automatically determine provider for non-Patternkit plugin ID @plugin_id.', ['@plugin_id' => $layoutBuilderPluginId]);
+              }
+            } catch (\Exception $e) {
+              $logger->warning('Exception determining provider for non-Patternkit plugin ID @plugin_id: @message', ['@plugin_id' => $layoutBuilderPluginId, '@message' => $e->getMessage()]);
+            }
+          }
+        }
+        else {
+          $logger->error('Unsupported component type "@type" or missing data for component in section @section_uuid.', [
+            '@type' => $jsonBlockData['type'],
+            '@section_uuid' => $sectionUuid,
+          ]);
+          continue;
+        }
+
+        if (empty($finalComponentConfigurationForLayoutBuilder)) {
+            $logger->error('Final component configuration for Layout Builder is empty for plugin @plugin_id. Skipping.', ['@plugin_id' => $layoutBuilderPluginId]);
+            continue;
+        }
+
+        $component = new SectionComponent(
+          $componentUuid,
+          $region,
+          $finalComponentConfigurationForLayoutBuilder
+        );
+
+        if (isset($jsonBlockData['weight'])) {
+          $component->setWeight((int) $jsonBlockData['weight']);
+        }
+        if (isset($jsonBlockData['additional'])) {
+          $component->set('additional', $jsonBlockData['additional']);
+        }
+        $componentsForSection[] = $component;
+      }
+    }
+
+    $thirdPartySettingsData = $jsonSectionData['third_party_settings'] ?? [];
+    if (!is_array($thirdPartySettingsData)) {
+        $logger->warning('Section "third_party_settings" found but is not an array for layout plugin @plugin. Using empty array.', ['@plugin' => $layoutPluginId]);
+        $thirdPartySettingsData = [];
+    }
+
+    $section = new Section(
+      $layoutPluginId,
+      $layoutSettings,
+      $componentsForSection,
+      $thirdPartySettingsData,
+      $sectionUuid
+    );
+
+    $sections[] = $section;
+  }
+
+  if (!empty($sections)) {
+    $layoutField = $node->get('layout_builder__layout');
+    $layoutField->setValue($sections);
+     $logger->info('Successfully applied AI Layout (Patternkit blocks as entities) to new node of type @type.', ['@type' => $node->bundle()]);
+  } else if (!empty($layoutData['sections'])) {
+      $logger->warning('Layout data sections were provided, but no valid sections or components were processed for node @nid (type: @type). The layout was not applied.', [
+          '@nid' => $node->id() ?? 'new',
+          '@type' => $node->bundle(),
+      ]);
+  }
+}
+
+/**
+ * Returns data structure for programmatic Layout Builder.
+ *
+ * This structure separates Layout Builder component meta-data from
+ * the data intended for the `patternkit_block` entity's `data` field.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ * The node for which to retrieve layout data.
+ *
+ * @return array
+ * The layout data array.
+ */
+function _ai_layout_builder_get_layout_data_for_node(NodeInterface $node): array {
+  $logger = \Drupal::service('logger.factory')->get('ai_layout_builder');
+  $logger->info('Function _ai_layout_builder_get_layout_data_for_node() called for node @nid. Returning hardcoded layout with Patternkit Card and Simple Text blocks.', ['@nid' => $node->id() ?? 'new']);
+
+  // Data for the "Card flex" Patternkit entity
+  $cardFlexPatternEntityData = json_decode('{"name":"@webRh\/sub_patterns\/card_flex\/card_flex","misc_data":"","has_header_bg_color":"false","config":{"id":"","class":"","align":"left","vertical_spacing":"min-stacked","background_color":"white","theme":"light","subtheme":"subtle"},"header":{"theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/simple_media\/simple_media","template":"","misc_data":"","config":{"align":"center","mobile_align":"center","background_color":"transparent","play_btn_color":"dark"},"video":{"video_src":""},"image":{"src":"\/rhdc\/managed-files\/logo.png","alt":"Logo placeholder","height":"","width":"","srcset":"","sizes":"","loading":"","image_element":"","decorative_image":false},"link_url":"","caption":"","lazy_load":"true"}]},"body":{"layout":"stacked","theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/text_basic\/text_basic","template":"","misc_data":"","title_seo":"p","headline_seo":"h3","headline_font_size":"small","align":"left","size":"band","subtheme":"standard","vertical_spacing":"min-stacked","title":"","headline":"AWS","content":"<p>Whether you are looking for managed solutions, or want to self-manage, our partnership helps your organizations using AWS cloud environments\u2014or looking to move there\u2014simplify hybrid cloud management.<\/p>","seo_position":""}]},"footer":{"theme":"dark","sub_patterns":[{"name":"@webRh\/components\/cta_multi_basic\/cta_multi_basic","template":"","misc_data":"","align":"left","cta_display":"stacked","ctas":[{"name":"@webRh\/sub_patterns\/simple_cta\/simple_cta","align":"left","type":"secondary","misc_data":"","link":{"text":"Learn more","href":"#","title":"","target":"_self"},"cta":{"analytics_text":"Learn more","analytics_category":""}}]}]}}', TRUE);
+  $cardFlexPatternEntityDataAzure = json_decode('{"name":"@webRh\/sub_patterns\/card_flex\/card_flex","misc_data":"","has_header_bg_color":"false","config":{"id":"","class":"","align":"left","vertical_spacing":"min-stacked","background_color":"white","theme":"light","subtheme":"subtle"},"header":{"theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/simple_media\/simple_media","template":"","misc_data":"","config":{"align":"center","mobile_align":"center","background_color":"transparent","play_btn_color":"dark"},"video":{"video_src":""},"image":{"src":"\/rhdc\/managed-files\/logo.png","alt":"Logo placeholder","height":"","width":"","srcset":"","sizes":"","loading":"","image_element":"","decorative_image":false},"link_url":"","caption":"","lazy_load":"true"}]},"body":{"layout":"stacked","theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/text_basic\/text_basic","template":"","misc_data":"","title_seo":"p","headline_seo":"h3","headline_font_size":"small","align":"left","size":"band","subtheme":"standard","vertical_spacing":"min-stacked","title":"","headline":"Microsoft Azure","content":"<p>Use jointly developed solutions that integrate with familiar Microsoft Azure tools and applications or work with a self-managed option. Need Red Hat tools on Microsoft Azure? We can help you find them.<\/p>","seo_position":""}]},"footer":{"theme":"dark","sub_patterns":[{"name":"@webRh\/components\/cta_multi_basic\/cta_multi_basic","template":"","misc_data":"","align":"left","cta_display":"stacked","ctas":[{"name":"@webRh\/sub_patterns\/simple_cta\/simple_cta","align":"left","type":"secondary","misc_data":"","link":{"text":"Learn more","href":"#","title":"","target":"_self"},"cta":{"analytics_text":"Learn more","analytics_category":""}}]}]}}', TRUE);
+  $cardFlexPatternEntityDataGoogle = json_decode('{"name":"@webRh\/sub_patterns\/card_flex\/card_flex","misc_data":"","has_header_bg_color":"false","config":{"id":"","class":"","align":"left","vertical_spacing":"min-stacked","background_color":"white","theme":"light","subtheme":"subtle"},"header":{"theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/simple_media\/simple_media","template":"","misc_data":"","config":{"align":"center","mobile_align":"center","background_color":"transparent","play_btn_color":"dark"},"video":{"video_src":""},"image":{"src":"\/rhdc\/managed-files\/logo.png","alt":"Logo placeholder","height":"","width":"","srcset":"","sizes":"","loading":"","image_element":"","decorative_image":false},"link_url":"","caption":"","lazy_load":"true"}]},"body":{"layout":"stacked","theme":"dark","sub_patterns":[{"name":"@webRh\/sub_patterns\/text_basic\/text_basic","template":"","misc_data":"","title_seo":"p","headline_seo":"h3","headline_font_size":"small","align":"left","size":"band","subtheme":"standard","vertical_spacing":"min-stacked","title":"","headline":"Google Cloud","content":"<p>Red Hat and Google Cloud simplify your cloud journey with flexible, proven, and innovative hybrid solutions. Get integrated solutions and tools to help you succeed with Google Cloud.<\/p>","seo_position":""}]},"footer":{"theme":"dark","sub_patterns":[{"name":"@webRh\/components\/cta_multi_basic\/cta_multi_basic","template":"","misc_data":"","align":"left","cta_display":"stacked","ctas":[{"name":"@webRh\/sub_patterns\/simple_cta\/simple_cta","align":"left","type":"secondary","misc_data":"","link":{"text":"Learn more","href":"#","title":"","target":"_self"},"cta":{"analytics_text":"Learn more","analytics_category":""}}]}]}}', TRUE);
+
+  // --- Meta-data for the "Card flex" Layout Builder component ---
+  $cardFlexComponentMeta = [
+      'label' => '[AI] Card Flex',
+      'label_display' => 'visible',
+      'presentation_style' => 'html',
+      'version' => '2.3.0',
+      'context_mapping' => [],
+      'pattern' => '117191',
+  ];
+
+  // --- Data for the "Simple Text" Patternkit entity ---
+  $simpleTextPatternEntityData = json_decode('{"name":"@webRh\/sub_patterns\/simple_text\/simple_text","template":"","misc_data":"","align":"left","size":"band","seo":{"position":"secondary","priority":"standard","title_seo":"auto","headline_seo":"auto"},"hash_link":"","subtheme":"standard","title":"Featured Providers","headline":"Red Hat partners with the largest public cloud providers","content":"<p>No matter what you need in a cloud provider, Red Hat has integration with a hyperscaler that fits your needs and works with your cloud committed spend. And working with a Red Hat cloud partner means you get all of the advantages of using directly integrated Red Hat solutions.<\/p>","seo_position":"","ctas":[]}', TRUE);
+  $simpleTextPatternEntityData2 = json_decode('{"name":"@webRh\/sub_patterns\/simple_text\/simple_text","template":"","misc_data":"","align":"left","size":"hero","seo":{"position":"secondary","priority":"standard","title_seo":"auto","headline_seo":"auto"},"hash_link":"","subtheme":"standard","title":"Red Hat Cloud Partners","headline":"Red Hat and your cloud provider","content":"<p>Together, Red Hat and leading cloud providers have forged strong partnerships that offer a multitude of Red Hat solutions ready to deploy and fit your specific needs.&nbsp;<br>Read our overview.<\/p>","seo_position":"","ctas":[{"name":"@webRh\/sub_patterns\/simple_cta\/simple_cta","align":"left","type":"primary","misc_data":"","link":{"text":"Unify your cloud","href":"internal:\/node\/1","title":"","target":"_self"},"cta":{"analytics_text":"Unify your cloud","analytics_category":""}}]}', TRUE);
+  $simpleTextPatternEntityData3 = [
+      'name' => '@webRh/sub_patterns/simple_text/simple_text',
+      'template' => '',
+      'misc_data' => '',
+      'align' => 'left',
+      'size' => 'band',
+      'seo' => [
+          'position' => 'secondary',
+          'priority' => 'standard',
+          'title_seo' => 'auto',
+          'headline_seo' => 'auto',
+      ],
+      'hash_link' => '',
+      'subtheme' => 'standard',
+      'title' => '',
+      'headline' => 'Transitioning to the cloud',
+      'content' => '<p>Moving applications and services to a cloud environment can be complex. But no matter which provider you choose, or what environment your organization runs, Red Hat’s partner ecosystem can help. Working with a Red Hat cloud partner means you get all the advantages of using Red Hat solutions integrated directly into your cloud services provider.</p>',
+      'seo_position' => '',
+      'ctas' => [],
+  ];
+  $simpleTextPatternEntityData4 = [
+      'name' => '@webRh/sub_patterns/simple_text/simple_text',
+      'template' => '',
+      'misc_data' => '',
+      'align' => 'left',
+      'size' => 'band',
+      'seo' => [
+          'position' => 'secondary',
+          'priority' => 'standard',
+          'title_seo' => 'auto',
+          'headline_seo' => 'auto',
+      ],
+      'hash_link' => '',
+      'subtheme' => 'standard',
+      'title' => 'Why Red Hat',
+      'headline' => 'Build a better foundation for hybrid cloud',
+      'content' => '<p>As the leader in enterprise open source, we believe using an open development model helps create a more stable and innovative set of solutions that support integration with a wide range of partners in our ecosystem. We build our solutions not only to work with the partners you need now, but adapt to your needs in the years to come.</p>',
+      'seo_position' => '',
+      'ctas' => [],
+  ];
+  $simpleTextPatternEntityData5 = [
+      'name' => '@webRh/sub_patterns/simple_text/simple_text',
+      'template' => '',
+      'misc_data' => '',
+      'align' => 'left',
+      'size' => 'band',
+      'seo' => [
+          'position' => 'secondary',
+          'priority' => 'standard',
+          'title_seo' => 'auto',
+          'headline_seo' => 'auto',
+      ],
+      'hash_link' => '',
+      'subtheme' => 'standard',
+      'title' => '',
+      'headline' => 'Solving challenges through partnership',
+      'content' => '<p>BP had a complex operational management approach with hundreds of product teams using various delivery models, which affected application development and deployment. To simplify processes and enhance productivity, BP used Red Hat® OpenShift® Container Platform running on Amazon Web Services (AWS) to build the Application Engineering Services’ Digital Conveyor.</p>',
+      'seo_position' => '',
+      'ctas' => [
+          [
+              'name' => '@webRh/sub_patterns/simple_cta/simple_cta',
+              'type' => 'secondary',
+              'link' => [
+                  'text' => 'See how we succeeded',
+                  'href' => '#',
+              ],
+          ],
+      ],
+  ];
+
+
+  // --- Meta-data for the "Simple Text" Layout Builder component ---
+  $simpleTextComponentMeta = [
+      'label' => '[AI] Simple Text',
+      'label_display' => 'visible',
+      'presentation_style' => 'html',
+      'version' => '2.4.0',
+      'context_mapping' => [],
+      'pattern' => '117161',
+  ];
+
+  // --- Data for the "Simple Media" Patternkit entity ---
+  $simpleMediaPatternEntityData = json_decode('{"name":"@webRh\/sub_patterns\/simple_media\/simple_media","template":"","misc_data":"","config":{"align":"center","mobile_align":"center","background_color":"transparent","play_btn_color":"dark"},"video":{"video_src":""},"image":{"src":"/rhdc/managed-files/600x400.png","alt":"Placeholder Image","height":"400","width":"600","srcset":"","sizes":"","loading":"","image_element":"","decorative_image":false},"link_url":"","caption":"","lazy_load":"true"}', TRUE);
+
+  // --- Meta-data for the "Simple Media" Layout Builder component ---
+  $simpleMediaComponentMeta = [
+      'label' => '[AI] Simple Media',
+      'label_display' => 'visible',
+      'presentation_style' => 'html',
+      'version' => '2.4.0',
+      'context_mapping' => [],
+      'pattern' => '115581',
+  ];
+
+  // --- Settings for the two-column "flexible" section ---
+  $flexibleSectionLayoutSettings2Col = [
+    'label' => 'Flexible Section (2-Column)',
+    'grid' => [
+      ['detail' => ['label' => 'Region 1','name' => 'tab1','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'],['column_span' => '6', 'breakpoint' => 'md']]]],'weight' => '1'],
+      ['detail' => ['label' => 'Region 2','name' => 'tab2','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'],['column_span' => '6', 'breakpoint' => 'md']]]],'weight' => '2'],
+    ],
+    // Other settings from your example
+    'title' => [], 'column_config' => [], 'red_hat_section_properties_style' => ['background_color' => 'none','theme' => 'none','padding_top' => 'padding_top_8','padding_bottom' => 'padding_bottom_8',],'red_hat_section_properties_defaults' => ['id' => '','section_width_type' => '0','classes' => '','exclude_wrapper' => NULL,'analytics_region' => '',],'properties' => ['inner_background_color' => 'none','inner_border' => 'no','inner_padding_horizontal' => '32','inner_padding_vertical' => '32','match_region_heights' => 0,'is_surface' => 0,'alignment' => [['horizontal' => 'none', 'vertical' => 'none']],'container_classes' => '','row_classes' => '',],
+  ];
+
+    // --- Settings for the two-column "flexible" section ---
+    $flexibleSectionLayoutSettings2ColGray = [
+      'label' => 'Flexible Section (2-Column)',
+      'red_hat_section_properties_style' => [
+        'background_color' => 'light_gray',
+        'theme' => 'light',
+        'padding_top' => 'padding_top_8',
+        'padding_bottom' => 'padding_bottom_8',
+      ],
+      'grid' => [
+        ['detail' => ['label' => 'Region 1','name' => 'tab1','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'],['column_span' => '6', 'breakpoint' => 'md']]]],'weight' => '1'],
+        ['detail' => ['label' => 'Region 2','name' => 'tab2','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'],['column_span' => '6', 'breakpoint' => 'md']]]],'weight' => '2'],
+      ],
+      // Other settings from your example
+      'title' => [], 'column_config' => [],'red_hat_section_properties_defaults' => ['id' => '','section_width_type' => '0','classes' => '','exclude_wrapper' => NULL,'analytics_region' => '',],'properties' => ['inner_background_color' => 'none','inner_border' => 'no','inner_padding_horizontal' => '32','inner_padding_vertical' => '32','match_region_heights' => 0,'is_surface' => 0,'alignment' => [['horizontal' => 'none', 'vertical' => 'none']],'container_classes' => '','row_classes' => '',],
+    ];
+
+  // --- Settings for the four-region "flexible" section ---
+  $flexibleSectionLayoutSettings4Col = [
+    'label' => 'Flexible Section (4-Region)',
+    'red_hat_section_properties_style' => [
+      'background_color' => 'light_gray',
+      'theme' => 'light',
+      'padding_top' => 'padding_top_8',
+      'padding_bottom' => 'padding_bottom_8',
+    ],
+    'grid' => [
+        // Corrected grid_configs for Region 1 to include a breakpoint
+        ['detail' => ['label' => 'Region 1','name' => 'tab1','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs']]]],'weight' => '-50'],
+        ['detail' => ['label' => 'Region 2','name' => 'tab2','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'], ['column_span' => '4', 'breakpoint' => 'md']]]],'weight' => '-49'],
+        ['detail' => ['label' => 'Region 3','name' => 'tab3','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'], ['column_span' => '4', 'breakpoint' => 'md']]]],'weight' => '-48'],
+        ['detail' => ['label' => 'Region 4','name' => 'tab4','properties' => '','grid_column' => ['grid_configs' => [['column_span' => '12', 'breakpoint' => 'xs'], ['column_span' => '4', 'breakpoint' => 'md']]]],'weight' => '-47'],
+    ],
+     // Other settings from your example
+    'title' => [], 'column_config' => [],'red_hat_section_properties_defaults' => ['id' => '','section_width_type' => '0','classes' => '','exclude_wrapper' => NULL,'analytics_region' => '',],'properties' => ['inner_background_color' => 'none','inner_border' => 'no','inner_padding_horizontal' => '32','inner_padding_vertical' => '32','match_region_heights' => 0,'is_surface' => 0,'alignment' => [['horizontal' => 'none', 'vertical' => 'none']],'container_classes' => '','row_classes' => '',],
+  ];
+
+  return [
+    'sections' => [
+      [
+        'layout_plugin_id' => 'flexible',
+        'layout_settings' => $flexibleSectionLayoutSettings2ColGray,
+        'components' => [
+          [
+            'type' => 'inline_block',
+            'region' => 'tab1', // First component in the first region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__text_simple__text',
+            'component_meta' => $simpleTextComponentMeta,
+            'pattern_entity_data' => $simpleTextPatternEntityData2,
+            'weight' => 0,
+          ],
+          [
+            'type' => 'inline_block',
+            'region' => 'tab2', // Second component in the second region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__media_simple__media',
+            'component_meta' => $simpleMediaComponentMeta,
+            'pattern_entity_data' => $simpleMediaPatternEntityData,
+            'weight' => 0,
+          ],
+        ],
+        'third_party_settings' => [],
+      ],
+      [
+        'layout_plugin_id' => 'flexible',
+        'layout_settings' => $flexibleSectionLayoutSettings4Col,
+        'components' => [
+          [
+            'type' => 'inline_block',
+            'region' => 'tab1', // Full width title region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__text_simple__text',
+            'component_meta' => ['label' => '[AI] Provider Title'] + $simpleTextComponentMeta,
+            'pattern_entity_data' => $simpleTextPatternEntityData,
+            'weight' => 0,
+          ],
+          [
+            'type' => 'inline_block',
+            'region' => 'tab2', // First of three columns
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_card__flex_card__flex',
+            'component_meta' => ['label' => '[AI] Card Flex (AWS)'] + $cardFlexComponentMeta,
+            'pattern_entity_data' => $cardFlexPatternEntityData,
+            'weight' => 0,
+          ],
+          [
+            'type' => 'inline_block',
+            'region' => 'tab3', // Second of three columns
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_card__flex_card__flex',
+            'component_meta' => ['label' => '[AI] Card Flex (Azure)'] + $cardFlexComponentMeta,
+            'pattern_entity_data' => $cardFlexPatternEntityDataAzure,
+            'weight' => 0,
+          ],
+          [
+            'type' => 'inline_block',
+            'region' => 'tab4', // Third of three columns
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_card__flex_card__flex',
+            'component_meta' => ['label' => '[AI] Card Flex (Google)'] + $cardFlexComponentMeta,
+            'pattern_entity_data' => $cardFlexPatternEntityDataGoogle,
+            'weight' => 0,
+          ],
+        ],
+        'third_party_settings' => [],
+      ],
+            [
+        'layout_plugin_id' => 'flexible',
+        'layout_settings' => $flexibleSectionLayoutSettings2Col,
+        'components' => [
+          [
+            'type' => 'inline_block',
+            'region' => 'tab1', // Media in the first region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__media_simple__media',
+            'component_meta' => $simpleMediaComponentMeta,
+            'pattern_entity_data' => $simpleMediaPatternEntityData,
+            'weight' => 0,
+          ],
+                    [
+            'type' => 'inline_block',
+            'region' => 'tab2', // Text in the second region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__text_simple__text',
+            'component_meta' => ['label' => '[AI] Transitioning Text'] + $simpleTextComponentMeta,
+            'pattern_entity_data' => $simpleTextPatternEntityData3,
+            'weight' => 0,
+          ],
+        ],
+        'third_party_settings' => [],
+      ],
+      [
+        'layout_plugin_id' => 'flexible',
+        'layout_settings' => $flexibleSectionLayoutSettings2Col,
+        'components' => [
+          [
+            'type' => 'inline_block',
+            'region' => 'tab1', // Text in the first region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__text_simple__text',
+            'component_meta' => $simpleTextComponentMeta,
+            'pattern_entity_data' => $simpleTextPatternEntityData4,
+            'weight' => 0,
+          ],
+          [
+            'type' => 'inline_block',
+            'region' => 'tab2', // Media in the second region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__media_simple__media',
+            'component_meta' => $simpleMediaComponentMeta,
+            'pattern_entity_data' => $simpleMediaPatternEntityData,
+            'weight' => 0,
+          ],
+        ],
+        'third_party_settings' => [],
+      ],
+      [
+        'layout_plugin_id' => 'flexible',
+        'layout_settings' => $flexibleSectionLayoutSettings2ColGray,
+        'components' => [
+          [
+            'type' => 'inline_block',
+            'region' => 'tab1', // Media in the first region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__media_simple__media',
+            'component_meta' => $simpleMediaComponentMeta,
+            'pattern_entity_data' => $simpleMediaPatternEntityData,
+            'weight' => 0,
+          ],
+                    [
+            'type' => 'inline_block',
+            'region' => 'tab2', // Text in the second region
+            'plugin_id' => 'patternkit_block:webRh_sub__patterns_simple__text_simple__text',
+            'component_meta' => ['label' => '[AI] BP Text'] + $simpleTextComponentMeta,
+            'pattern_entity_data' => $simpleTextPatternEntityData5,
+            'weight' => 0,
+          ],
+        ],
+        'third_party_settings' => [],
+      ],
+    ],
+  ];
+}

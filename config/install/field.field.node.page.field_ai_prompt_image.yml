@@ -1,0 +1,53 @@
+# File: ai_layout_builder/config/install/field.field.node.page.field_ai_prompt_image.yml
+uuid: null # Drupal will generate a UUID when importing
+langcode: en
+status: true
+dependencies:
+  config:
+    - field.storage.node.field_ai_prompt_image
+    - node.type.page # Depends on the 'page' content type
+  module:
+    - image
+# The bundle (content type) this field is attached to.
+bundle: page
+# The entity type.
+entity_type: node
+# The field name.
+field_name: field_ai_prompt_image
+# Label for the field.
+label: 'AI Prompt Image'
+description: 'Upload a PNG or JPG image that will be used to inspire the AI layout generation. This image is not displayed to end-users.'
+required: false # Set to true if the field should be mandatory
+translatable: false # Typically images might not be directly translatable, but their alt/title texts are via the file entity.
+default_value: {  }
+default_value_callback: ''
+settings:
+  # Settings for the image field widget.
+  handler: 'default:file'
+  handler_settings: {  }
+  # Directory within the file system where files are stored.
+  file_directory: 'ai-layout-images/[date:custom:Y]-[date:custom:m]'
+  # Allowed file extensions.
+  file_extensions: 'png jpg jpeg'
+  # Maximum file size. Empty for no limit (uses system default).
+  max_filesize: ''
+  # Maximum image resolution (widthxheight). Empty for no limit.
+  max_resolution: ''
+  # Minimum image resolution (widthxheight). Empty for no limit.
+  min_resolution: ''
+  # Whether the alt field is enabled. Set to false to remove it.
+  alt_field: false
+  # Whether the alt field is required (only relevant if alt_field is true).
+  alt_field_required: false
+  # Whether the title field is enabled.
+  title_field: false
+  title_field_required: false
+  # Default image (not typically used for content fields).
+  default_image:
+    uuid: null
+    alt: ''
+    title: ''
+    width: null
+    height: null
+# Field type specific settings.
+field_type: image

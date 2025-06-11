@@ -1,0 +1,38 @@
+# File: ai_layout_builder/config/install/field.storage.node.field_ai_prompt_image.yml
+uuid: null # Drupal will generate a UUID when importing
+langcode: en
+status: true
+dependencies:
+  module:
+    - file
+    - image
+    - node
+# The entity type this field is attached to.
+entity_type: node
+# The machine name of the field.
+id: node.field_ai_prompt_image
+# The field name.
+field_name: field_ai_prompt_image
+# Field type.
+type: image
+settings:
+  # URI scheme for uploaded files (e.g., public, private).
+  uri_scheme: public
+  # Default image settings.
+  default_image:
+    uuid: null # No default image
+    alt: ''
+    title: ''
+    width: null
+    height: null
+  # Target type for the image entity reference.
+  target_type: file
+  # Display settings for the field.
+  display_field: false
+  display_default: false
+# Cardinality: -1 for unlimited, 1 for single value.
+cardinality: 1
+translatable: true # Whether the field is translatable
+locked: false # Whether the field is locked from UI changes after creation
+persist_with_no_fields: false
+custom_storage: false

@@ -1,0 +1,9 @@
+name: AI Layout Builder
+type: module
+description: Programmatically builds Layout Builder layouts
+core_version_requirement: ^10 || ^11
+package: AI
+
+dependencies:
+  - drupal:layout_builder
+  - drupal:ai
